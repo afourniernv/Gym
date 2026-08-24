@@ -25,7 +25,7 @@ from os import environ, getenv
 from pathlib import Path
 from threading import Thread
 from traceback import format_exc, print_exc
-from typing import Any, List, Literal, Optional, TextIO, Tuple, Type, Union, Unpack
+from typing import Any, List, Literal, NamedTuple, Optional, TextIO, Tuple, Type, Union, Unpack
 from uuid import uuid4
 
 import orjson
@@ -77,6 +77,13 @@ from nemo_gym.rollout_correlation import current_rollout_id, maybe_rollout_id_fr
 
 _GLOBAL_AIOHTTP_CLIENT: Union[None, ClientSession] = None
 _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG: bool = False
+
+
+class _PickleSafeRequestInfo(NamedTuple):
+    url: str
+    method: str
+    headers: dict[str, str]
+    real_url: str
 
 
 class GlobalAIOHTTPAsyncClientConfig(BaseModel):
@@ -276,6 +283,18 @@ Response content: {content}""")
         except ClientResponseError as e:
             # Set the response content here so we have access to it down the line.
             e.response_content = content
+            # aiohttp stores unpicklable multidict proxies in this exception.
+            # Preserve request details as plain Python values for cross-process propagation.
+            request_info = e.request_info
+            e.request_info = _PickleSafeRequestInfo(
+                url=str(request_info.url),
+                method=request_info.method,
+                headers=dict(request_info.headers),
+                real_url=str(request_info.real_url),
+            )
+            e.history = ()
+            e.headers = dict(e.headers) if e.headers is not None else None
+            e.args = (e.request_info, e.history)
             raise e
 
 

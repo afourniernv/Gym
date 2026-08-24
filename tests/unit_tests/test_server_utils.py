@@ -12,10 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import multiprocessing
 import socket
+from concurrent.futures import ProcessPoolExecutor
 from unittest.mock import AsyncMock, MagicMock
 
+from aiohttp import ClientResponseError, RequestInfo
+from multidict import CIMultiDict, CIMultiDictProxy
 from pytest import MonkeyPatch, raises
+from yarl import URL
 
 import nemo_gym.global_config
 import nemo_gym.server_utils
@@ -33,6 +38,7 @@ from nemo_gym.server_utils import (
     SimpleServer,
     _make_keepalive_socket_factory,
     initialize_ray,
+    raise_for_status,
 )
 
 
@@ -48,7 +54,50 @@ _TEST_ADDR_INFO = (
 )
 
 
+def _return_exception_from_child_process(error: ClientResponseError) -> ClientResponseError:
+    return error
+
+
 class TestServerUtils:
+    async def test_raise_for_status_preserves_message_across_process_boundary(self) -> None:
+        headers = CIMultiDictProxy(CIMultiDict({"x-request-id": "request-123"}))
+        request_info = RequestInfo(
+            url=URL("http://resources-server.test/verify"),
+            method="POST",
+            headers=headers,
+            real_url=URL("http://resources-server.test/verify"),
+        )
+        original_error = ClientResponseError(
+            request_info=request_info,
+            history=(),
+            status=500,
+            message="verifier failed",
+            headers=headers,
+        )
+        response = MagicMock()
+        response.ok = False
+        response.content.read = AsyncMock(return_value=b'{"detail":"backend unavailable"}')
+        response.request_info = request_info
+        response.raise_for_status.side_effect = original_error
+
+        with raises(ClientResponseError) as exc_info:
+            await raise_for_status(response)
+
+        error = exc_info.value
+        assert str(error) == ("500, message='verifier failed', url='http://resources-server.test/verify'")
+        assert error.response_content == b'{"detail":"backend unavailable"}'
+
+        with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as executor:
+            restored_error = executor.submit(_return_exception_from_child_process, error).result()
+
+        assert isinstance(restored_error, ClientResponseError)
+        assert str(restored_error) == str(error)
+        assert restored_error.status == 500
+        assert restored_error.message == "verifier failed"
+        assert restored_error.response_content == error.response_content
+        assert restored_error.request_info.method == "POST"
+        assert restored_error.request_info.headers == {"x-request-id": "request-123"}
+
     def test_global_aiohttp_client_request_debug_enabled(self, monkeypatch: MonkeyPatch) -> None:
         monkeypatch.setattr(nemo_gym.server_utils, "_GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG", False)
         assert not nemo_gym.server_utils.is_global_aiohttp_client_request_debug_enabled()
