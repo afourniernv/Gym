@@ -673,7 +673,16 @@ class RolloutCollectionHelper(BaseModel):
             agent_name = (row.get(AGENT_REF_KEY_NAME) or {}).get("name")
             basis = agent_name if agent_name is not None else row.get(TASK_SOURCE_KEY_NAME)
             if config.agent_map:
-                mapped = config.agent_map.get(basis) if basis is not None else None
+                # A row may carry both an agent_ref and a task_source (derived artifacts do);
+                # a map entry for either re-routes it, the agent name taking precedence.
+                mapped = next(
+                    (
+                        config.agent_map[key]
+                        for key in (agent_name, row.get(TASK_SOURCE_KEY_NAME))
+                        if key is not None and key in config.agent_map
+                    ),
+                    None,
+                )
                 if mapped is None:
                     mapped = config.agent_map.get("_default")
                 if mapped is not None:
@@ -1327,12 +1336,21 @@ Aggregate metrics: {aggregate_metrics_fpath}""")
         after valid rows have already been dispatched.
         """
         requested = {name for row in examples if (name := (row.get(AGENT_REF_KEY_NAME) or {}).get("name")) is not None}
-        available = set(global_config_dict.keys())
+        available = {
+            str(name)
+            for name, block in global_config_dict.items()
+            if isinstance(block, DictConfig) and "responses_api_agents" in block
+        }
         unknown = sorted(requested - available)
         if not unknown:
             return
         hints = []
         for name in unknown:
+            # Naming a non-agent instance (e.g. a resources server via agent_map) is as fatal as a
+            # typo: /run only exists on agent servers.
+            if name in global_config_dict:
+                hints.append(f"{name!r} (exists but is not an agent instance)")
+                continue
             close = get_close_matches(name, available, n=1)
             hints.append(f"{name!r}" + (f" (did you mean {close[0]!r}?)" if close else ""))
         raise ValueError(
